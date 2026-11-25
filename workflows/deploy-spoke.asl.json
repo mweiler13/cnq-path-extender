@@ -1,0 +1,555 @@
+{
+  "Comment": "Deploy a CNQ spoke for hub ${hub_name} and link it with a CDF portal. Input: path, vpc_cidr, and region or placement (the tool chooses the region: the first, nearest the hub or in placement.regions order, where the cluster fits, or with compute, where a capacity reservation for the compute instance succeeds), optional instance_type, node_count, availability_zone, client_resources, compute (an instance of any type, mounted to the spoke, optionally with an application set up), and pcs (an AWS PCS Slurm cluster mounting the spoke, optionally with a pipeline set up).",
+  "StartAt": "Validate",
+  "States": {
+    "Validate": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${lambda_arn}",
+        "Payload": { "action": "validate", "hub_uuid": "${hub_uuid}", "input.$": "$$.Execution.Input" }
+      },
+      "ResultSelector": {
+        "region.$": "$.Payload.region",
+        "path.$": "$.Payload.path",
+        "vpc_cidr.$": "$.Payload.vpc_cidr",
+        "instance_type.$": "$.Payload.instance_type",
+        "node_count.$": "$.Payload.node_count",
+        "cluster_version.$": "$.Payload.cluster_version",
+        "availability_zone.$": "$.Payload.availability_zone",
+        "client_resources.$": "$.Payload.client_resources",
+        "compute.$": "$.Payload.compute",
+        "pcs.$": "$.Payload.pcs",
+        "hunt.$": "$.Payload.hunt",
+        "candidates.$": "$.Payload.candidates",
+        "skipped_regions.$": "$.Payload.skipped_regions",
+        "search_order.$": "$.Payload.search_order",
+        "capacity.$": "$.Payload.capacity",
+        "hub_portal_warnings.$": "$.Payload.hub_portal_warnings"
+      },
+      "ResultPath": "$.launch",
+      "Retry": [${lambda_retry}],
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "NotifyFailure" }],
+      "Next": "Find capacity?"
+    },
+    "Find capacity?": {
+      "Type": "Choice",
+      "Comment": "A new spoke with a compute instance: reserve its capacity first; that decides the region and zone.",
+      "Choices": [{ "Variable": "$.launch.hunt", "BooleanEquals": true, "Next": "StartCapacityHunt" }],
+      "Default": "BuildNetwork"
+    },
+    "StartCapacityHunt": {
+      "Type": "Pass",
+      "Result": { "attempt": 0, "deadline": 0 },
+      "ResultPath": "$.capacity",
+      "Next": "FindCapacity"
+    },
+    "FindCapacity": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${lambda_arn}",
+        "Payload": { "action": "find_capacity", "launch.$": "$.launch", "hunt.$": "$.capacity" }
+      },
+      "ResultSelector": {
+        "found.$": "$.Payload.found",
+        "gave_up.$": "$.Payload.gave_up",
+        "attempt.$": "$.Payload.attempt",
+        "deadline.$": "$.Payload.deadline",
+        "wait_seconds.$": "$.Payload.wait_seconds",
+        "region.$": "$.Payload.region",
+        "availability_zone.$": "$.Payload.availability_zone",
+        "instance_type.$": "$.Payload.instance_type",
+        "reservation_id.$": "$.Payload.reservation_id",
+        "last_errors.$": "$.Payload.last_errors"
+      },
+      "ResultPath": "$.capacity",
+      "Retry": [${lambda_retry}],
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "ReleaseCapacity" }],
+      "Next": "Capacity found?"
+    },
+    "Capacity found?": {
+      "Type": "Choice",
+      "Choices": [
+        { "Variable": "$.capacity.found", "BooleanEquals": true, "Next": "UseCapacity" },
+        { "Variable": "$.capacity.gave_up", "BooleanEquals": true, "Next": "NoCapacity" }
+      ],
+      "Default": "WaitForCapacity"
+    },
+    "WaitForCapacity": { "Type": "Wait", "SecondsPath": "$.capacity.wait_seconds", "Next": "FindCapacity" },
+    "NoCapacity": {
+      "Type": "Pass",
+      "Parameters": {
+        "Error": "NoCapacity",
+        "Cause.$": "States.Format('No compute capacity found in {} attempts. Last errors: {}. Regions skipped: {}', $.capacity.attempt, States.JsonToString($.capacity.last_errors), States.JsonToString($.launch.skipped_regions))"
+      },
+      "ResultPath": "$.error",
+      "Next": "ReleaseCapacity"
+    },
+    "UseCapacity": {
+      "Type": "Pass",
+      "Comment": "The reservation fixes the spoke's region and zone.",
+      "Parameters": {
+        "region.$": "$.capacity.region",
+        "availability_zone.$": "$.capacity.availability_zone",
+        "path.$": "$.launch.path",
+        "vpc_cidr.$": "$.launch.vpc_cidr",
+        "instance_type.$": "$.launch.instance_type",
+        "node_count.$": "$.launch.node_count",
+        "cluster_version.$": "$.launch.cluster_version",
+        "client_resources.$": "$.launch.client_resources",
+        "compute.$": "$.launch.compute",
+        "pcs.$": "$.launch.pcs",
+        "hunt": false,
+        "candidates.$": "$.launch.candidates",
+        "skipped_regions.$": "$.launch.skipped_regions",
+        "search_order.$": "$.launch.search_order",
+        "capacity.$": "$.capacity",
+        "hub_portal_warnings.$": "$.launch.hub_portal_warnings"
+      },
+      "ResultPath": "$.launch",
+      "Next": "BuildNetwork"
+    },
+    "BuildNetwork": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::codebuild:startBuild.sync",
+      "Parameters": {
+        "ProjectName": "${codebuild_project}",
+        "EnvironmentVariablesOverride": [
+          { "Type": "PLAINTEXT", "Name": "TF_ACTION", "Value": "apply" },
+          { "Type": "PLAINTEXT", "Name": "TF_STACKS", "Value": "network" },
+          { "Type": "PLAINTEXT", "Name": "TF_STATE_PREFIX", "Value.$": "States.Format('${hub_name}/spokes/{}', $.launch.region)" },
+          { "Type": "PLAINTEXT", "Name": "TF_VAR_region", "Value.$": "$.launch.region" },
+          { "Type": "PLAINTEXT", "Name": "TF_VAR_vpc_cidr", "Value.$": "$.launch.vpc_cidr" },
+          { "Type": "PLAINTEXT", "Name": "TF_VAR_availability_zone", "Value.$": "$.launch.availability_zone" },
+          { "Type": "PLAINTEXT", "Name": "TF_VAR_client_resources", "Value.$": "States.Format('{}', $.launch.client_resources)" },
+          { "Type": "PLAINTEXT", "Name": "TF_VAR_instance_type", "Value.$": "$.launch.instance_type" },
+          { "Type": "PLAINTEXT", "Name": "TF_VAR_node_count", "Value.$": "States.Format('{}', $.launch.node_count)" },
+          { "Type": "PLAINTEXT", "Name": "TF_VAR_cluster_version", "Value.$": "$.launch.cluster_version" }
+        ]
+      },
+      "ResultPath": null,
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "ReleaseCapacity" }],
+      "Next": "ClusterAndCompute"
+    },
+    "ClusterAndCompute": {
+      "Type": "Parallel",
+      "Comment": "Build the cluster and link the portal while (optionally) launching the compute instance. A cluster or portal failure stops both; a compute instance failure is caught in its branch and reported in the summary.",
+      "Branches": [
+        {
+          "StartAt": "BuildCluster",
+          "States": {
+            "BuildCluster": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::codebuild:startBuild.sync",
+              "Parameters": {
+                "ProjectName": "${codebuild_project}",
+                "EnvironmentVariablesOverride": [
+                  { "Type": "PLAINTEXT", "Name": "TF_ACTION", "Value": "apply" },
+                  { "Type": "PLAINTEXT", "Name": "TF_STACKS", "Value": "cluster" },
+                  { "Type": "PLAINTEXT", "Name": "TF_STATE_PREFIX", "Value.$": "States.Format('${hub_name}/spokes/{}', $.launch.region)" },
+                  { "Type": "PLAINTEXT", "Name": "TF_VAR_region", "Value.$": "$.launch.region" },
+                  { "Type": "PLAINTEXT", "Name": "TF_VAR_vpc_cidr", "Value.$": "$.launch.vpc_cidr" },
+                  { "Type": "PLAINTEXT", "Name": "TF_VAR_instance_type", "Value.$": "$.launch.instance_type" },
+                  { "Type": "PLAINTEXT", "Name": "TF_VAR_node_count", "Value.$": "States.Format('{}', $.launch.node_count)" },
+                  { "Type": "PLAINTEXT", "Name": "TF_VAR_cluster_version", "Value.$": "$.launch.cluster_version" }
+                ]
+              },
+              "ResultPath": null,
+              "Next": "ReadSpoke"
+            },
+            "ReadSpoke": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "${lambda_arn}",
+                "Payload": { "action": "read_spoke", "region.$": "$.launch.region" }
+              },
+              "ResultSelector": {
+                "primary_ips.$": "$.Payload.primary_ips",
+                "admin_secret_arn.$": "$.Payload.admin_secret_arn",
+                "api_endpoint.$": "$.Payload.api_endpoint",
+                "cluster_uuid.$": "$.Payload.cluster_uuid",
+                "deployment_unique_name.$": "$.Payload.deployment_unique_name"
+              },
+              "ResultPath": "$.spoke",
+              "Retry": [${lambda_retry}],
+              "Next": "StartHealthCheck"
+            },
+            "StartHealthCheck": {
+              "Type": "Pass",
+              "Result": { "healthy": false, "attempt": 0 },
+              "ResultPath": "$.health",
+              "Next": "CheckHealth"
+            },
+            "CheckHealth": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "${lambda_arn}",
+                "Payload": { "action": "check_health", "spoke.$": "$.spoke", "attempt.$": "$.health.attempt" }
+              },
+              "ResultSelector": {
+                "healthy.$": "$.Payload.healthy",
+                "reason.$": "$.Payload.reason",
+                "attempt.$": "$.Payload.attempt"
+              },
+              "ResultPath": "$.health",
+              "Retry": [${lambda_retry}],
+              "Next": "Healthy?"
+            },
+            "Healthy?": {
+              "Type": "Choice",
+              "Choices": [
+                { "Variable": "$.health.healthy", "BooleanEquals": true, "Next": "CreatePortal" },
+                { "Variable": "$.health.attempt", "NumericGreaterThanEquals": 90, "Next": "HealthTimeout" }
+              ],
+              "Default": "WaitForHealth"
+            },
+            "WaitForHealth": { "Type": "Wait", "Seconds": 60, "Next": "CheckHealth" },
+            "HealthTimeout": {
+              "Type": "Pass",
+              "Parameters": {
+                "Error": "HealthTimeout",
+                "Cause.$": "States.Format('Spoke not healthy after 90 minutes. Last check: {}', $.health.reason)"
+              },
+              "ResultPath": "$.error",
+              "Next": "ClusterFailed"
+            },
+            "CreatePortal": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "${lambda_arn}",
+                "Payload": { "action": "create_portal", "hub_uuid": "${hub_uuid}", "spoke.$": "$.spoke", "launch.$": "$.launch" }
+              },
+              "ResultSelector": {
+                "spoke_portal_id.$": "$.Payload.spoke_portal_id",
+                "hub_portal_id.$": "$.Payload.hub_portal_id"
+              },
+              "ResultPath": "$.portal",
+              "Retry": [${lambda_retry}, ${connection_retry}],
+              "Next": "AcceptPortal"
+            },
+            "AcceptPortal": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "${lambda_arn}",
+                "Payload": { "action": "accept_portal", "spoke.$": "$.spoke", "portal.$": "$.portal" }
+              },
+              "ResultPath": null,
+              "Retry": [${lambda_retry}, ${connection_retry}],
+              "Next": "StartVerify"
+            },
+            "StartVerify": {
+              "Type": "Pass",
+              "Result": { "ok": false, "attempt": 0 },
+              "ResultPath": "$.verify",
+              "Next": "Verify"
+            },
+            "Verify": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "${lambda_arn}",
+                "Payload": {
+                  "action": "verify_portal",
+                  "spoke.$": "$.spoke",
+                  "portal.$": "$.portal",
+                  "attempt.$": "$.verify.attempt"
+                }
+              },
+              "ResultSelector": {
+                "ok.$": "$.Payload.ok",
+                "usable.$": "$.Payload.usable",
+                "state.$": "$.Payload.state",
+                "status.$": "$.Payload.status",
+                "attempt.$": "$.Payload.attempt"
+              },
+              "ResultPath": "$.verify",
+              "Retry": [${lambda_retry}, ${connection_retry}],
+              "Next": "Verified?"
+            },
+            "Verified?": {
+              "Type": "Choice",
+              "Comment": "ACTIVE: done. Accepted and authorized but not ACTIVE: give the connections about 2 minutes to come up, then report it (a disconnected relationship elsewhere on the hub keeps it DEGRADED indefinitely). Not even accepted: keep trying for 10 minutes.",
+              "Choices": [
+                { "Variable": "$.verify.ok", "BooleanEquals": true, "Next": "PortalActive" },
+                {
+                  "And": [
+                    { "Variable": "$.verify.attempt", "NumericGreaterThanEquals": 5 },
+                    { "Variable": "$.verify.usable", "BooleanEquals": true }
+                  ],
+                  "Next": "PortalNotActive"
+                },
+                { "Variable": "$.verify.attempt", "NumericGreaterThanEquals": 20, "Next": "VerifyTimeout" }
+              ],
+              "Default": "WaitForVerify"
+            },
+            "WaitForVerify": { "Type": "Wait", "Seconds": 30, "Next": "Verify" },
+            "VerifyTimeout": {
+              "Type": "Pass",
+              "Parameters": {
+                "Error": "VerifyTimeout",
+                "Cause.$": "States.Format('Portal not ACTIVE after 10 minutes. Last state {}, status {}', $.verify.state, $.verify.status)"
+              },
+              "ResultPath": "$.error",
+              "Next": "ClusterFailed"
+            },
+            "ClusterFailed": {
+              "Type": "Fail",
+              "ErrorPath": "$.error.Error",
+              "CausePath": "$.error.Cause"
+            },
+            "PortalActive": {
+              "Type": "Pass",
+              "Result": { "message": null },
+              "ResultPath": "$.portal_warning",
+              "Next": "PortalPing"
+            },
+            "PortalNotActive": {
+              "Type": "Pass",
+              "Comment": "Accepted and authorized, so data flows; report it rather than fail a working spoke.",
+              "Parameters": {
+                "message.$": "States.Format('Portal is {}/{}, not ACTIVE: it is accepted and authorized, so data flows, but some connections between the clusters are missing. See hub_portal_warnings (another relationship on the hub that is not healthy is the usual cause) and portal_ping.', $.verify.state, $.verify.status)"
+              },
+              "ResultPath": "$.portal_warning",
+              "Next": "PortalPing"
+            },
+            "PortalPing": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "${lambda_arn}",
+                "Payload": { "action": "portal_ping", "hub_uuid": "${hub_uuid}", "spoke.$": "$.spoke" }
+              },
+              "ResultSelector": { "spoke_to_hub.$": "$.Payload.spoke_to_hub", "hub_to_spoke.$": "$.Payload.hub_to_spoke" },
+              "ResultPath": "$.portal_ping",
+              "Retry": [${lambda_retry}],
+              "Comment": "Informational: a failure here is reported, not fatal.",
+              "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "$.portal_ping", "Next": "ClusterReady" }],
+              "Next": "ClusterReady"
+            },
+            "ClusterReady": { "Type": "Pass", "End": true }
+          }
+        },
+        {
+          "StartAt": "Compute requested?",
+          "States": {
+            "Compute requested?": {
+              "Type": "Choice",
+              "Choices": [{ "Variable": "$.launch.compute.requested", "BooleanEquals": true, "Next": "StartComputeHunt" }],
+              "Default": "NoCompute"
+            },
+            "NoCompute": {
+              "Type": "Pass",
+              "Result": { "requested": false },
+              "ResultPath": "$.compute",
+              "End": true
+            },
+            "StartComputeHunt": {
+              "Type": "Pass",
+              "Result": { "attempt": 0, "deadline": 0 },
+              "ResultPath": "$.compute",
+              "Next": "LaunchCompute"
+            },
+            "LaunchCompute": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "${lambda_arn}",
+                "Payload": { "action": "launch_compute", "launch.$": "$.launch", "hunt.$": "$.compute" }
+              },
+              "ResultSelector": {
+                "requested.$": "$.Payload.requested",
+                "launched.$": "$.Payload.launched",
+                "gave_up.$": "$.Payload.gave_up",
+                "attempt.$": "$.Payload.attempt",
+                "deadline.$": "$.Payload.deadline",
+                "wait_seconds.$": "$.Payload.wait_seconds",
+                "instance_id.$": "$.Payload.instance_id",
+                "instance_type.$": "$.Payload.instance_type",
+                "private_ip.$": "$.Payload.private_ip",
+                "availability_zone.$": "$.Payload.availability_zone",
+                "application.$": "$.Payload.application",
+                "last_errors.$": "$.Payload.last_errors"
+              },
+              "ResultPath": "$.compute",
+              "Retry": [${lambda_retry}],
+              "Comment": "A compute instance problem must not abort the branch: that would stop the cluster build mid-apply. It's reported in the summary instead.",
+              "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "$.compute_error", "Next": "ComputeFailed" }],
+              "Next": "Compute launched?"
+            },
+            "ComputeFailed": {
+              "Type": "Pass",
+              "Parameters": {
+                "requested": true,
+                "launched": false,
+                "gave_up": true,
+                "error.$": "$.compute_error.Cause"
+              },
+              "ResultPath": "$.compute",
+              "End": true
+            },
+            "Compute launched?": {
+              "Type": "Choice",
+              "Choices": [
+                { "Variable": "$.compute.launched", "BooleanEquals": true, "Next": "ComputeDone" },
+                { "Variable": "$.compute.gave_up", "BooleanEquals": true, "Next": "ComputeDone" }
+              ],
+              "Default": "WaitForCompute"
+            },
+            "WaitForCompute": { "Type": "Wait", "SecondsPath": "$.compute.wait_seconds", "Next": "LaunchCompute" },
+            "ComputeDone": { "Type": "Pass", "End": true }
+          }
+        }
+      ],
+      "ResultSelector": {
+        "launch.$": "$[0].launch",
+        "spoke.$": "$[0].spoke",
+        "portal.$": "$[0].portal",
+        "verify.$": "$[0].verify",
+        "portal_warning.$": "$[0].portal_warning",
+        "portal_ping.$": "$[0].portal_ping",
+        "compute.$": "$[1].compute"
+      },
+      "ResultPath": "$",
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "ReleaseCapacity" }],
+      "Next": "Mount compute?"
+    },
+    "Mount compute?": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "And": [
+            { "Variable": "$.compute.launched", "IsPresent": true },
+            { "Variable": "$.compute.launched", "BooleanEquals": true }
+          ],
+          "Next": "PrepareCompute"
+        }
+      ],
+      "Default": "PCS requested?"
+    },
+    "PrepareCompute": {
+      "Type": "Task",
+      "Comment": "Tags the instance with the spoke's node IPs; it mounts the spoke on its own.",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${lambda_arn}",
+        "Payload": {
+          "action": "prepare_compute",
+          "region.$": "$.launch.region",
+          "path.$": "$.launch.path",
+          "spoke.$": "$.spoke",
+          "compute.$": "$.compute"
+        }
+      },
+      "ResultSelector": { "mount.$": "$.Payload.mount" },
+      "ResultPath": "$.compute_mount",
+      "Retry": [${lambda_retry}],
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "ReleaseCapacity" }],
+      "Next": "PCS requested?"
+    },
+    "PCS requested?": {
+      "Type": "Choice",
+      "Comment": "The PCS cluster comes last: its nodes mount the spoke, so the portal (and its path) must exist.",
+      "Choices": [{ "Variable": "$.launch.pcs.requested", "BooleanEquals": true, "Next": "BuildPcs" }],
+      "Default": "Summary"
+    },
+    "BuildPcs": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::codebuild:startBuild.sync",
+      "Parameters": {
+        "ProjectName": "${codebuild_project}",
+        "EnvironmentVariablesOverride": [
+          { "Type": "PLAINTEXT", "Name": "TF_ACTION", "Value": "apply" },
+          { "Type": "PLAINTEXT", "Name": "TF_STACKS", "Value": "pcs" },
+          { "Type": "PLAINTEXT", "Name": "TF_STATE_PREFIX", "Value.$": "States.Format('${hub_name}/spokes/{}', $.launch.region)" },
+          { "Type": "PLAINTEXT", "Name": "TF_VAR_region", "Value.$": "$.launch.region" },
+          { "Type": "PLAINTEXT", "Name": "TF_VAR_vpc_cidr", "Value.$": "$.launch.vpc_cidr" },
+          { "Type": "PLAINTEXT", "Name": "TF_VAR_path", "Value.$": "$.launch.path" },
+          { "Type": "PLAINTEXT", "Name": "TF_VAR_pcs", "Value.$": "States.JsonToString($.launch.pcs)" }
+        ]
+      },
+      "ResultPath": null,
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "ReleaseCapacity" }],
+      "Next": "Summary"
+    },
+    "Summary": {
+      "Type": "Pass",
+      "Parameters": {
+        "result": "Spoke is ready and linked to the hub.",
+        "hub": "${hub_name}",
+        "region.$": "$.launch.region",
+        "availability_zone.$": "$.launch.availability_zone",
+        "path.$": "$.launch.path",
+        "version.$": "$.launch.cluster_version",
+        "instance_type.$": "$.launch.instance_type",
+        "node_count.$": "$.launch.node_count",
+        "spoke_api.$": "$.spoke.api_endpoint",
+        "spoke_node_ips.$": "$.spoke.primary_ips",
+        "spoke_admin_secret_arn.$": "$.spoke.admin_secret_arn",
+        "spoke_portal_id.$": "$.portal.spoke_portal_id",
+        "hub_portal_id.$": "$.portal.hub_portal_id",
+        "portal_status.$": "$.verify.status",
+        "portal_warning.$": "$.portal_warning",
+        "portal_ping.$": "$.portal_ping",
+        "hub_portal_warnings.$": "$.launch.hub_portal_warnings",
+        "compute.$": "$.compute",
+        "pcs.$": "$.launch.pcs",
+        "compute_capacity.$": "$.launch.capacity",
+        "regions_skipped.$": "$.launch.skipped_regions",
+        "regions_search_order.$": "$.launch.search_order"
+      },
+      "Next": "NotifySuccess"
+    },
+    "NotifySuccess": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "TopicArn": "${topic_arn}",
+        "Subject.$": "States.Format('cnq-path-extender: spoke ready in {}', $.region)",
+        "Message.$": "States.JsonToString($)"
+      },
+      "ResultPath": null,
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "$.notify_error", "Next": "Done" }],
+      "End": true
+    },
+    "Done": {
+      "Type": "Succeed",
+      "Comment": "Reached only when the success email couldn't be sent; the work itself succeeded."
+    },
+    "ReleaseCapacity": {
+      "Type": "Task",
+      "Comment": "Cancel a capacity reservation still held, so a failed deploy doesn't pay for it until it expires.",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${lambda_arn}",
+        "Payload": { "action": "release_capacity", "state.$": "$" }
+      },
+      "ResultSelector": { "cancelled.$": "$.Payload.cancelled" },
+      "ResultPath": "$.released_capacity",
+      "Retry": [${lambda_retry}],
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "$.release_error", "Next": "NotifyFailure" }],
+      "Next": "NotifyFailure"
+    },
+    "NotifyFailure": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "TopicArn": "${topic_arn}",
+        "Subject": "cnq-path-extender: spoke deploy FAILED (hub ${hub_name})",
+        "Message.$": "States.JsonToString($)"
+      },
+      "ResultPath": null,
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "$.notify_error", "Next": "Failed" }],
+      "Next": "Failed"
+    },
+    "Failed": {
+      "Type": "Fail",
+      "ErrorPath": "$.error.Error",
+      "CausePath": "$.error.Cause"
+    }
+  }
+}

@@ -1,0 +1,181 @@
+{
+  "Comment": "Remove a CNQ spoke of hub ${hub_name}: terminate its compute instance (if any), delete the portal, then terraform destroy, sweep up anything left and check nothing is; if clean, delete the spoke's files in the state bucket. Input: region, optional force (skip the spoke side of portal deletion if the spoke is unreachable).",
+  "StartAt": "Force given?",
+  "States": {
+    "Force given?": {
+      "Type": "Choice",
+      "Choices": [{ "Variable": "$.force", "IsPresent": true, "Next": "UseInput" }],
+      "Default": "DefaultForce"
+    },
+    "UseInput": {
+      "Type": "Pass",
+      "Parameters": { "args": { "region.$": "$.region", "force.$": "$.force" } },
+      "Next": "ReadSpoke"
+    },
+    "DefaultForce": {
+      "Type": "Pass",
+      "Parameters": { "args": { "region.$": "$.region", "force": false } },
+      "Next": "ReadSpoke"
+    },
+    "ReadSpoke": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${lambda_arn}",
+        "Payload": { "action": "read_spoke", "region.$": "$.args.region", "require_running": true }
+      },
+      "ResultSelector": {
+        "has_cluster.$": "$.Payload.has_cluster",
+        "primary_ips.$": "$.Payload.primary_ips",
+        "admin_secret_arn.$": "$.Payload.admin_secret_arn",
+        "launch.$": "$.Payload.launch"
+      },
+      "ResultPath": "$.spoke",
+      "Retry": [${lambda_retry}],
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "NotifyFailure" }],
+      "Next": "TerminateCompute"
+    },
+    "TerminateCompute": {
+      "Type": "Task",
+      "Comment": "The compute instance's network interface would block deleting the spoke subnet.",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${lambda_arn}",
+        "Payload": { "action": "terminate_compute", "region.$": "$.args.region" }
+      },
+      "ResultSelector": { "terminated.$": "$.Payload.terminated" },
+      "ResultPath": "$.compute",
+      "Retry": [${lambda_retry}],
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "NotifyFailure" }],
+      "Next": "Cluster exists?"
+    },
+    "Cluster exists?": {
+      "Type": "Choice",
+      "Comment": "No cluster (its build failed or it's already gone) means no portal to remove.",
+      "Choices": [{ "Variable": "$.spoke.has_cluster", "BooleanEquals": true, "Next": "DeletePortal" }],
+      "Default": "Destroy"
+    },
+    "DeletePortal": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${lambda_arn}",
+        "Payload": { "action": "delete_portal", "hub_uuid": "${hub_uuid}", "spoke.$": "$.spoke", "force.$": "$.args.force" }
+      },
+      "ResultSelector": { "deleted.$": "$.Payload" },
+      "ResultPath": "$.portal",
+      "Retry": [${lambda_retry}, ${connection_retry}],
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "NotifyFailure" }],
+      "Next": "Destroy"
+    },
+    "Destroy": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::codebuild:startBuild.sync",
+      "Parameters": {
+        "ProjectName": "${codebuild_project}",
+        "EnvironmentVariablesOverride": [
+          { "Type": "PLAINTEXT", "Name": "TF_ACTION", "Value": "destroy" },
+          { "Type": "PLAINTEXT", "Name": "TF_STATE_PREFIX", "Value.$": "States.Format('${hub_name}/spokes/{}', $.args.region)" },
+          { "Type": "PLAINTEXT", "Name": "TF_VAR_region", "Value.$": "$.args.region" },
+          { "Type": "PLAINTEXT", "Name": "TF_VAR_vpc_cidr", "Value.$": "$.spoke.launch.vpc_cidr" },
+          { "Type": "PLAINTEXT", "Name": "TF_VAR_instance_type", "Value.$": "$.spoke.launch.instance_type" },
+          { "Type": "PLAINTEXT", "Name": "TF_VAR_node_count", "Value.$": "States.Format('{}', $.spoke.launch.node_count)" },
+          { "Type": "PLAINTEXT", "Name": "TF_VAR_cluster_version", "Value.$": "$.spoke.launch.cluster_version" }
+        ]
+      },
+      "ResultSelector": { "build_id.$": "$.Build.Id" },
+      "ResultPath": "$.destroy",
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "NotifyFailure" }],
+      "Next": "ReadCleanupReport"
+    },
+    "ReadCleanupReport": {
+      "Type": "Task",
+      "Comment": "The destroy build's final check: is anything of the spoke left?",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${lambda_arn}",
+        "Payload": { "action": "cleanup_report", "region.$": "$.args.region", "build_id.$": "$.destroy.build_id" }
+      },
+      "ResultSelector": {
+        "clean.$": "$.Payload.clean",
+        "leftovers.$": "$.Payload.leftovers",
+        "check_errors.$": "$.Payload.check_errors",
+        "removed_by_sweep.$": "$.Payload.removed_by_sweep"
+      },
+      "ResultPath": "$.cleanup",
+      "Retry": [${lambda_retry}],
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "NotifyFailure" }],
+      "Next": "Clean?"
+    },
+    "Clean?": {
+      "Type": "Choice",
+      "Choices": [{ "Variable": "$.cleanup.clean", "BooleanEquals": true, "Next": "ForgetSpoke" }],
+      "Default": "NotifyLeftovers"
+    },
+    "ForgetSpoke": {
+      "Type": "Task",
+      "Comment": "Delete the spoke's emptied state files and cleanup report, so later runs (refresh-hub, placement) don't see a spoke here. Failing this doesn't fail the destroy: it's reported.",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${lambda_arn}",
+        "Payload": { "action": "forget_spoke", "region.$": "$.args.region" }
+      },
+      "ResultSelector": { "deleted.$": "$.Payload.deleted" },
+      "ResultPath": "$.state_files",
+      "Retry": [${lambda_retry}],
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "$.state_files_error", "Next": "NotifySuccess" }],
+      "Next": "NotifySuccess"
+    },
+    "NotifyLeftovers": {
+      "Type": "Task",
+      "Comment": "Three rounds of destroy and sweep left something, or a check couldn't run: list it for a person.",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "TopicArn": "${topic_arn}",
+        "Subject.$": "States.Format('cnq-path-extender: {} spoke destroyed, LEFTOVERS need removing', $.args.region)",
+        "Message.$": "States.JsonToString($.cleanup)"
+      },
+      "ResultPath": null,
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "$.notify_error", "Next": "LeftoversRemain" }],
+      "Next": "LeftoversRemain"
+    },
+    "LeftoversRemain": {
+      "Type": "Fail",
+      "Error": "LeftoversRemain",
+      "Cause": "Some of the spoke's resources couldn't be removed automatically; the notification lists them for removal by hand. spoke/cleanup.py check confirms when they're gone."
+    },
+    "NotifySuccess": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "TopicArn": "${topic_arn}",
+        "Subject.$": "States.Format('cnq-path-extender: spoke removed from {}', $.args.region)",
+        "Message.$": "States.JsonToString($)"
+      },
+      "ResultPath": null,
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "$.notify_error", "Next": "Done" }],
+      "End": true
+    },
+    "Done": {
+      "Type": "Succeed",
+      "Comment": "Reached only when the success email couldn't be sent; the work itself succeeded."
+    },
+    "NotifyFailure": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "TopicArn": "${topic_arn}",
+        "Subject": "cnq-path-extender: spoke destroy FAILED (hub ${hub_name})",
+        "Message.$": "States.JsonToString($)"
+      },
+      "ResultPath": null,
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "$.notify_error", "Next": "Failed" }],
+      "Next": "Failed"
+    },
+    "Failed": {
+      "Type": "Fail",
+      "ErrorPath": "$.error.Error",
+      "CausePath": "$.error.Cause"
+    }
+  }
+}

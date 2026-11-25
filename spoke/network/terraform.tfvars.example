@@ -1,0 +1,17 @@
+# Normally the deploy-spoke workflow supplies all of these. This file is only for
+# running `terraform plan` on the network stack by hand. Copy to terraform.tfvars.
+
+# Launch inputs
+region          = "eu-central-1"
+vpc_cidr        = "<spoke VPC CIDR: IPv4, /16 to /24, a range reserved for this spoke>"
+instance_type   = "i7i.8xlarge"
+node_count      = 3
+cluster_version = "7.10.1.1"
+
+# Hub facts (from bootstrap)
+hub_name              = "hubprod-a1b2c3"
+hub_region            = "us-west-2"
+hub_vpc_id            = "vpc-0123456789abcdef0"
+hub_vpc_cidr          = "<hub VPC CIDR: the hub.vpc_cidr output of bootstrap>"
+hub_route_table_ids   = ["rtb-0123456789abcdef0"]
+cdf_security_group_id = "sg-0123456789abcdef0"

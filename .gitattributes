@@ -1,0 +1,4 @@
+# Keep LF everywhere: the spoke bundle and buildspec run on Linux in CodeBuild.
+* text=auto eol=lf
+*.png binary
+*.zip binary

@@ -1,0 +1,266 @@
+{
+  "Comment": "Local mode (docs/local-mode.md): deploy the modules in hub ${hub_name}'s own VPC, mounting the hub directly, with no spoke. Input: path, and compute and/or pcs, as for deploy-spoke.",
+  "StartAt": "Validate",
+  "States": {
+    "Validate": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${lambda_arn}",
+        "Payload": { "action": "validate_local", "hub_uuid": "${hub_uuid}", "input.$": "$$.Execution.Input" }
+      },
+      "ResultSelector": {
+        "region.$": "$.Payload.region",
+        "site.$": "$.Payload.site",
+        "state_prefix.$": "$.Payload.state_prefix",
+        "path.$": "$.Payload.path",
+        "availability_zone.$": "$.Payload.availability_zone",
+        "network.$": "$.Payload.network",
+        "compute.$": "$.Payload.compute",
+        "pcs.$": "$.Payload.pcs",
+        "capacity.$": "$.Payload.capacity"
+      },
+      "ResultPath": "$.launch",
+      "Retry": [${lambda_retry}],
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "NotifyFailure" }],
+      "Next": "ComputeAndPcs"
+    },
+    "ComputeAndPcs": {
+      "Type": "Parallel",
+      "Comment": "Each branch reports its own failure instead of failing the other mid-build.",
+      "Branches": [
+        {
+          "StartAt": "Compute requested?",
+          "States": {
+            "Compute requested?": {
+              "Type": "Choice",
+              "Choices": [{ "Variable": "$.launch.compute.requested", "BooleanEquals": true, "Next": "BuildClient" }],
+              "Default": "NoCompute"
+            },
+            "NoCompute": { "Type": "Pass", "Result": { "requested": false }, "End": true },
+            "BuildClient": {
+              "Type": "Task",
+              "Comment": "Security group and Session Manager role for the compute instance, in the hub VPC.",
+              "Resource": "arn:aws:states:::codebuild:startBuild.sync",
+              "Parameters": {
+                "ProjectName": "${codebuild_project}",
+                "EnvironmentVariablesOverride": [
+                  { "Type": "PLAINTEXT", "Name": "TF_MODE", "Value": "local" },
+                  { "Type": "PLAINTEXT", "Name": "TF_ACTION", "Value": "apply" },
+                  { "Type": "PLAINTEXT", "Name": "TF_STACKS", "Value": "client" },
+                  { "Type": "PLAINTEXT", "Name": "TF_STATE_PREFIX", "Value.$": "$.launch.state_prefix" },
+                  { "Type": "PLAINTEXT", "Name": "TF_VAR_region", "Value.$": "$.launch.region" },
+                  { "Type": "PLAINTEXT", "Name": "TF_VAR_local_vpc_id", "Value.$": "$.launch.network.vpc_id" },
+                  { "Type": "PLAINTEXT", "Name": "TF_VAR_local_subnet_id", "Value.$": "$.launch.network.subnet_id" },
+                  { "Type": "PLAINTEXT", "Name": "TF_VAR_local_availability_zone", "Value.$": "$.launch.availability_zone" }
+                ]
+              },
+              "ResultPath": null,
+              "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "$.compute_error", "Next": "ComputeFailed" }],
+              "Next": "StartComputeHunt"
+            },
+            "StartComputeHunt": {
+              "Type": "Pass",
+              "Result": { "attempt": 0, "deadline": 0 },
+              "ResultPath": "$.compute",
+              "Next": "LaunchCompute"
+            },
+            "LaunchCompute": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "${lambda_arn}",
+                "Payload": { "action": "launch_compute", "launch.$": "$.launch", "hunt.$": "$.compute" }
+              },
+              "ResultSelector": {
+                "requested.$": "$.Payload.requested",
+                "launched.$": "$.Payload.launched",
+                "gave_up.$": "$.Payload.gave_up",
+                "attempt.$": "$.Payload.attempt",
+                "deadline.$": "$.Payload.deadline",
+                "wait_seconds.$": "$.Payload.wait_seconds",
+                "instance_id.$": "$.Payload.instance_id",
+                "instance_type.$": "$.Payload.instance_type",
+                "private_ip.$": "$.Payload.private_ip",
+                "availability_zone.$": "$.Payload.availability_zone",
+                "application.$": "$.Payload.application",
+                "last_errors.$": "$.Payload.last_errors"
+              },
+              "ResultPath": "$.compute",
+              "Retry": [${lambda_retry}],
+              "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "$.compute_error", "Next": "ComputeFailed" }],
+              "Next": "Compute launched?"
+            },
+            "Compute launched?": {
+              "Type": "Choice",
+              "Choices": [
+                { "Variable": "$.compute.launched", "BooleanEquals": true, "Next": "PrepareCompute" },
+                { "Variable": "$.compute.gave_up", "BooleanEquals": true, "Next": "ComputeDone" }
+              ],
+              "Default": "WaitForCompute"
+            },
+            "WaitForCompute": { "Type": "Wait", "SecondsPath": "$.compute.wait_seconds", "Next": "LaunchCompute" },
+            "PrepareCompute": {
+              "Type": "Task",
+              "Comment": "Tags the instance with the hub's node IPs; it mounts the hub on its own.",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "${lambda_arn}",
+                "Payload": {
+                  "action": "prepare_compute",
+                  "region.$": "$.launch.region",
+                  "path.$": "$.launch.path",
+                  "spoke": { "primary_ips.$": "$.launch.network.nfs_hosts" },
+                  "compute.$": "$.compute"
+                }
+              },
+              "ResultSelector": { "mount.$": "$.Payload.mount" },
+              "ResultPath": "$.compute.mount",
+              "Retry": [${lambda_retry}],
+              "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "$.compute_error", "Next": "ComputeFailed" }],
+              "Next": "ComputeDone"
+            },
+            "ComputeFailed": {
+              "Type": "Pass",
+              "Parameters": { "requested": true, "launched": false, "error.$": "$.compute_error.Cause" },
+              "ResultPath": "$.compute",
+              "Next": "ComputeDone"
+            },
+            "ComputeDone": { "Type": "Pass", "OutputPath": "$.compute", "End": true }
+          }
+        },
+        {
+          "StartAt": "PCS requested?",
+          "States": {
+            "PCS requested?": {
+              "Type": "Choice",
+              "Choices": [{ "Variable": "$.launch.pcs.requested", "BooleanEquals": true, "Next": "BuildPcs" }],
+              "Default": "NoPcs"
+            },
+            "NoPcs": { "Type": "Pass", "Result": { "requested": false }, "End": true },
+            "BuildPcs": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::codebuild:startBuild.sync",
+              "Parameters": {
+                "ProjectName": "${codebuild_project}",
+                "EnvironmentVariablesOverride": [
+                  { "Type": "PLAINTEXT", "Name": "TF_MODE", "Value": "local" },
+                  { "Type": "PLAINTEXT", "Name": "TF_ACTION", "Value": "apply" },
+                  { "Type": "PLAINTEXT", "Name": "TF_STACKS", "Value": "pcs" },
+                  { "Type": "PLAINTEXT", "Name": "TF_STATE_PREFIX", "Value.$": "$.launch.state_prefix" },
+                  { "Type": "PLAINTEXT", "Name": "TF_VAR_region", "Value.$": "$.launch.region" },
+                  { "Type": "PLAINTEXT", "Name": "TF_VAR_path", "Value.$": "$.launch.path" },
+                  { "Type": "PLAINTEXT", "Name": "TF_VAR_network", "Value.$": "States.JsonToString($.launch.network)" },
+                  { "Type": "PLAINTEXT", "Name": "TF_VAR_pcs", "Value.$": "States.JsonToString($.launch.pcs)" }
+                ]
+              },
+              "ResultPath": null,
+              "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "$.pcs_error", "Next": "PcsFailed" }],
+              "Next": "PcsDone"
+            },
+            "PcsFailed": {
+              "Type": "Pass",
+              "Parameters": { "requested": true, "built": false, "error.$": "$.pcs_error.Cause" },
+              "End": true
+            },
+            "PcsDone": {
+              "Type": "Pass",
+              "Parameters": { "requested": true, "built": true, "settings.$": "$.launch.pcs" },
+              "End": true
+            }
+          }
+        }
+      ],
+      "ResultSelector": { "compute.$": "$[0]", "pcs.$": "$[1]" },
+      "ResultPath": "$.result",
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "NotifyFailure" }],
+      "Next": "Summary"
+    },
+    "Summary": {
+      "Type": "Pass",
+      "Parameters": {
+        "result": "Local mode: deployed in the hub's VPC, mounting the hub directly.",
+        "hub": "${hub_name}",
+        "region.$": "$.launch.region",
+        "availability_zone.$": "$.launch.availability_zone",
+        "subnet_id.$": "$.launch.network.subnet_id",
+        "path.$": "$.launch.path",
+        "hub_node_ips.$": "$.launch.network.nfs_hosts",
+        "compute.$": "$.result.compute",
+        "pcs.$": "$.result.pcs"
+      },
+      "Next": "All built?"
+    },
+    "All built?": {
+      "Type": "Choice",
+      "Comment": "The modules are all local mode deploys, so one that failed fails the execution (after the email says which).",
+      "Choices": [
+        {
+          "And": [
+            { "Variable": "$.pcs.built", "IsPresent": true },
+            { "Variable": "$.pcs.built", "BooleanEquals": false }
+          ],
+          "Next": "NotifyPartFailed"
+        },
+        {
+          "And": [
+            { "Variable": "$.compute.launched", "IsPresent": true },
+            { "Variable": "$.compute.launched", "BooleanEquals": false }
+          ],
+          "Next": "NotifyPartFailed"
+        }
+      ],
+      "Default": "NotifySuccess"
+    },
+    "NotifyPartFailed": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "TopicArn": "${topic_arn}",
+        "Subject": "cnq-path-extender: local deploy FAILED (hub ${hub_name})",
+        "Message.$": "States.JsonToString($)"
+      },
+      "ResultPath": null,
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "$.notify_error", "Next": "PartFailed" }],
+      "Next": "PartFailed"
+    },
+    "PartFailed": {
+      "Type": "Fail",
+      "Error": "ModuleFailed",
+      "Cause": "A requested module (compute or pcs) failed to build; the email has its error. Whatever did build is still running: destroy-local removes it."
+    },
+    "NotifySuccess": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "TopicArn": "${topic_arn}",
+        "Subject": "cnq-path-extender: local deploy finished (hub ${hub_name})",
+        "Message.$": "States.JsonToString($)"
+      },
+      "ResultPath": null,
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "$.notify_error", "Next": "Done" }],
+      "End": true
+    },
+    "Done": {
+      "Type": "Succeed",
+      "Comment": "Reached only when the success email couldn't be sent; the work itself succeeded."
+    },
+    "NotifyFailure": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "TopicArn": "${topic_arn}",
+        "Subject": "cnq-path-extender: local deploy FAILED (hub ${hub_name})",
+        "Message.$": "States.JsonToString($)"
+      },
+      "ResultPath": null,
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "$.notify_error", "Next": "Failed" }],
+      "Next": "Failed"
+    },
+    "Failed": {
+      "Type": "Fail",
+      "ErrorPath": "$.error.Error",
+      "CausePath": "$.error.Cause"
+    }
+  }
+}

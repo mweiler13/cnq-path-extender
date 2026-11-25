@@ -1,0 +1,118 @@
+{
+  "Comment": "After hub ${hub_name}'s nodes are replaced (new IPs, e.g. after changing their instance type), point every spoke's portal at the hub's current nodes. Input: {} for every spoke, or {\"region\": \"...\"} for one. Changes only portals whose hub addresses are out of date.",
+  "StartAt": "ListSpokes",
+  "States": {
+    "ListSpokes": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${lambda_arn}",
+        "Payload": { "action": "list_spokes", "hub_uuid": "${hub_uuid}", "input.$": "$$.Execution.Input" }
+      },
+      "ResultSelector": { "regions.$": "$.Payload.regions", "hub_ips.$": "$.Payload.hub_ips" },
+      "ResultPath": "$.spokes",
+      "Retry": [${lambda_retry}],
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "NotifyFailure" }],
+      "Next": "RefreshEach"
+    },
+    "RefreshEach": {
+      "Type": "Map",
+      "ItemsPath": "$.spokes.regions",
+      "ItemSelector": { "region.$": "$$.Map.Item.Value" },
+      "MaxConcurrency": 4,
+      "ItemProcessor": {
+        "ProcessorConfig": { "Mode": "INLINE" },
+        "StartAt": "Refresh",
+        "States": {
+          "Refresh": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::lambda:invoke",
+            "Parameters": {
+              "FunctionName": "${lambda_arn}",
+              "Payload": { "action": "refresh_hub_hosts", "hub_uuid": "${hub_uuid}", "region.$": "$.region" }
+            },
+            "OutputPath": "$.Payload",
+            "Retry": [${lambda_retry}, ${connection_retry}],
+            "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "RefreshFailed" }],
+            "End": true
+          },
+          "RefreshFailed": {
+            "Type": "Pass",
+            "Comment": "One spoke failing doesn't stop the others; it's reported in the summary.",
+            "Parameters": { "region.$": "$.region", "result": "FAILED", "detail.$": "$.error.Cause" },
+            "End": true
+          }
+        }
+      },
+      "ResultPath": "$.results",
+      "Next": "CollectFailed"
+    },
+    "CollectFailed": {
+      "Type": "Pass",
+      "Parameters": { "failed.$": "$.results[?(@.result == 'FAILED')]" },
+      "ResultPath": "$.check",
+      "Next": "CountFailed"
+    },
+    "CountFailed": {
+      "Type": "Pass",
+      "Parameters": { "failed.$": "$.check.failed", "count.$": "States.ArrayLength($.check.failed)" },
+      "ResultPath": "$.check",
+      "Next": "Failures?"
+    },
+    "Failures?": {
+      "Type": "Choice",
+      "Choices": [{ "Variable": "$.check.count", "NumericGreaterThan": 0, "Next": "NotifyPartial" }],
+      "Default": "NotifySuccess"
+    },
+    "NotifySuccess": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "TopicArn": "${topic_arn}",
+        "Subject": "cnq-path-extender: spoke portals refreshed (hub ${hub_name})",
+        "Message.$": "States.JsonToString($)"
+      },
+      "ResultPath": null,
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "$.notify_error", "Next": "Done" }],
+      "End": true
+    },
+    "Done": {
+      "Type": "Succeed",
+      "Comment": "Reached only when the success email couldn't be sent; the work itself succeeded."
+    },
+    "NotifyPartial": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "TopicArn": "${topic_arn}",
+        "Subject": "cnq-path-extender: spoke portal refresh FAILED for some spokes (hub ${hub_name})",
+        "Message.$": "States.JsonToString($)"
+      },
+      "ResultPath": null,
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "$.notify_error", "Next": "SomeFailed" }],
+      "Next": "SomeFailed"
+    },
+    "SomeFailed": {
+      "Type": "Fail",
+      "Error": "RefreshFailed",
+      "Cause": "At least one spoke's portal couldn't be updated; the notification says which and why. Run the workflow again for that region once it's reachable."
+    },
+    "NotifyFailure": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "TopicArn": "${topic_arn}",
+        "Subject": "cnq-path-extender: spoke portal refresh FAILED (hub ${hub_name})",
+        "Message.$": "States.JsonToString($)"
+      },
+      "ResultPath": null,
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "$.notify_error", "Next": "Failed" }],
+      "Next": "Failed"
+    },
+    "Failed": {
+      "Type": "Fail",
+      "ErrorPath": "$.error.Error",
+      "CausePath": "$.error.Cause"
+    }
+  }
+}

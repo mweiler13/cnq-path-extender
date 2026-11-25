@@ -1,0 +1,218 @@
+version: 0.2
+
+# Runs the spoke stacks. Set by the CodeBuild project: TF_VERSION, TF_STATE_BUCKET,
+# TF_STATE_REGION, and the hub's TF_VAR_* values. Set per run by the workflow:
+# TF_ACTION (apply|destroy), TF_STATE_PREFIX (<hub>/spokes/<region>), and the launch
+# TF_VAR_* values.
+#
+# Three stacks, each planned only after what it builds on exists:
+#   apply:   the stacks in TF_STACKS (default "network cluster"), in order. The deploy
+#            workflow runs network, then cluster (while it launches the compute
+#            instance), then pcs once the portal is up (if a PCS cluster was asked for).
+#   destroy: pcs (if it has resources), cluster, network; then cleanup.py removes
+#            whatever of the spoke is left (including what Terraform lost track of) and
+#            checks nothing remains, up to 3 rounds. Its report goes to
+#            <TF_STATE_PREFIX>/cleanup-report.json for the destroy workflow.
+# Local mode (TF_MODE=local) hands over to local/build.sh.
+
+env:
+  shell: bash
+
+phases:
+  install:
+    commands:
+      - curl -fsSLo /tmp/terraform.zip "https://releases.hashicorp.com/terraform/${TF_VERSION}/terraform_${TF_VERSION}_linux_amd64.zip"
+      - curl -fsSLo /tmp/terraform.sums "https://releases.hashicorp.com/terraform/${TF_VERSION}/terraform_${TF_VERSION}_SHA256SUMS"
+      - echo "$(grep " terraform_${TF_VERSION}_linux_amd64.zip$" /tmp/terraform.sums | cut -d' ' -f1)  /tmp/terraform.zip" | sha256sum -c -
+      - unzip -o -q /tmp/terraform.zip -d /usr/local/bin
+      - terraform version
+      - if [ "$TF_ACTION" = destroy ]; then python3 -m pip install --quiet boto3; fi
+
+  build:
+    commands:
+      - |
+        set -euo pipefail
+
+        # Local mode (deploy-local, destroy-local) has its own steps: spoke/local/build.sh.
+        if [ "${TF_MODE:-}" = local ]; then exec bash local/build.sh; fi
+
+        export TF_VAR_state_bucket="$TF_STATE_BUCKET"
+        export TF_VAR_state_region="$TF_STATE_REGION"
+        export TF_VAR_network_state_key="${TF_STATE_PREFIX}/network.tfstate"
+        export TF_VAR_cluster_state_key="${TF_STATE_PREFIX}/cluster.tfstate"
+        # Passed whole: the Qumulo provider can't take a list built in config (see spoke/cluster/variables.tf).
+        export TF_VAR_allow_cidrs="[\"${TF_VAR_vpc_cidr}\",\"${TF_VAR_hub_vpc_cidr}\"]"
+
+        init() {
+          terraform -chdir="$1" init -input=false \
+            -backend-config="bucket=${TF_STATE_BUCKET}" \
+            -backend-config="key=${TF_STATE_PREFIX}/$1.tfstate" \
+            -backend-config="region=${TF_STATE_REGION}"
+        }
+
+        # A build stopped mid-run never releases its state lock, which would block every
+        # later run. No build outlives the project's build_timeout, so a lock older than
+        # TF_LOCK_STALE_MINUTES (set by bootstrap/codebuild.tf) belongs to a dead build.
+        STALE_LOCK_MINUTES=${TF_LOCK_STALE_MINUTES:-190}
+        clear_stale_lock() {
+          local key="${TF_STATE_PREFIX}/$1.tfstate.tflock" modified age
+          modified=$(aws s3api head-object --region "$TF_STATE_REGION" --bucket "$TF_STATE_BUCKET" \
+            --key "$key" --query LastModified --output text 2>/dev/null) || return 0
+          age=$(( $(date +%s) - $(date -d "$modified" +%s) ))
+          if [ "$age" -gt $(( STALE_LOCK_MINUTES * 60 )) ]; then
+            echo "Removing stale state lock s3://${TF_STATE_BUCKET}/${key} ($(( age / 60 )) minutes old)"
+            aws s3 rm --region "$TF_STATE_REGION" "s3://${TF_STATE_BUCKET}/${key}"
+          fi
+        }
+
+        run() {
+          local stack="$1"
+          echo "===== terraform ${TF_ACTION} ${stack} ====="
+          clear_stale_lock "$stack"
+          init "$stack"
+          terraform -chdir="$stack" "$TF_ACTION" -input=false -auto-approve
+        }
+
+        # A cluster create that fails partway (e.g. an SCP denies RunInstances) can leave
+        # Qumulo provider security groups in the spoke VPC that no Terraform state tracks,
+        # which then block deleting the VPC. The VPC exists only for this spoke, so any
+        # non-default security group still in it after the cluster is gone is a leftover.
+        #
+        # A create that's killed partway (e.g. its execution was aborted) can also leave
+        # the provider's provisioner instance running, which holds its security group.
+        # Instances in the spoke VPC carrying this spoke's tags are terminated first: the
+        # cluster's own nodes are already destroyed by now, and the compute instance was
+        # terminated before the build. Instances you launched yourself aren't tagged, and
+        # are left alone.
+        sweep_vpc_security_groups() {
+          local vpc client_sg
+          init network >/dev/null
+          vpc=$(terraform -chdir=network output -raw vpc_id 2>/dev/null || true)
+          [ -n "$vpc" ] || return 0
+          # Managed by the network stack; destroyed with it.
+          client_sg=$(terraform -chdir=network output -raw client_security_group_id 2>/dev/null || true)
+          local leftovers
+          leftovers=$(aws ec2 describe-instances --region "$TF_VAR_region" \
+            --filters "Name=vpc-id,Values=${vpc}" \
+                      "Name=tag:cnq-path-extender:hub,Values=${TF_VAR_hub_name}" \
+                      "Name=instance-state-name,Values=pending,running,stopping,stopped" \
+            --query 'Reservations[].Instances[].InstanceId' --output text)
+          if [ -n "$leftovers" ] && [ "$leftovers" != None ]; then
+            echo "Terminating leftover instances in spoke VPC ${vpc}: ${leftovers}"
+            aws ec2 terminate-instances --region "$TF_VAR_region" --instance-ids $leftovers >/dev/null
+            aws ec2 wait instance-terminated --region "$TF_VAR_region" --instance-ids $leftovers
+          fi
+          local sgs
+          sgs=$(aws ec2 describe-security-groups --region "$TF_VAR_region" \
+            --filters "Name=vpc-id,Values=${vpc}" \
+            --query "SecurityGroups[?GroupName!='default' && GroupId!='${client_sg}'].GroupId" --output text)
+          for sg in $sgs; do
+            echo "Removing leftover security group ${sg} from spoke VPC ${vpc}"
+            # Drop rules first so groups that reference each other can be deleted.
+            for dir in ingress egress; do
+              perms=$(aws ec2 describe-security-groups --region "$TF_VAR_region" --group-ids "$sg" \
+                --query "SecurityGroups[0].$([ $dir = ingress ] && echo IpPermissions || echo IpPermissionsEgress)" --output json)
+              [ "$perms" = "[]" ] || aws ec2 "revoke-security-group-${dir}" --region "$TF_VAR_region" \
+                --group-id "$sg" --ip-permissions "$perms" >/dev/null
+            done
+          done
+          for sg in $sgs; do
+            aws ec2 delete-security-group --region "$TF_VAR_region" --group-id "$sg"
+          done
+        }
+
+        # The cluster's deployment name, if it already exists: used to check its instances
+        # are running, and on destroy to remove the CloudWatch log groups
+        # (/qumulo/<deployment>/...) that the Qumulo provider leaves behind.
+        note_cluster_deployment() {
+          init cluster >/dev/null
+          CLUSTER_DEPLOYMENT=$(terraform -chdir=cluster output -raw deployment_unique_name 2>/dev/null || true)
+        }
+        delete_cluster_log_groups() {
+          [ -n "${CLUSTER_DEPLOYMENT:-}" ] || return 0
+          for lg in $(aws logs describe-log-groups --region "$TF_VAR_region" \
+              --log-group-name-prefix "/qumulo/${CLUSTER_DEPLOYMENT}" \
+              --query 'logGroups[].logGroupName' --output text); do
+            [ "$lg" = None ] && continue
+            echo "Removing leftover log group ${lg}"
+            aws logs delete-log-group --region "$TF_VAR_region" --log-group-name "$lg"
+          done
+        }
+
+        # The PCS stack exists only for spokes launched with pcs. Its destroy reads data
+        # sources (the PCS AMI, among others) that fail where PCS isn't offered, so it runs
+        # only when its state holds resources.
+        destroy_pcs() {
+          init pcs >/dev/null
+          if [ -n "$(terraform -chdir=pcs state list 2>/dev/null)" ]; then
+            run pcs
+          fi
+        }
+
+        # The Qumulo provider reports a cluster whose instances are stopped as not existing.
+        # Terraform then drops it from state: destroy removes nothing and leaves the cluster
+        # running untracked, and apply plans a second cluster. Refuse to continue instead.
+        require_cluster_running() {
+          [ -n "${CLUSTER_DEPLOYMENT:-}" ] || return 0
+          local stopped
+          stopped=$(aws ec2 describe-instances --region "$TF_VAR_region" \
+            --filters "Name=tag:Qumulo-Cluster,Values=${CLUSTER_DEPLOYMENT}" \
+                      "Name=instance-state-name,Values=stopping,stopped" \
+            --query 'Reservations[].Instances[].InstanceId' --output text)
+          if [ -n "$stopped" ] && [ "$stopped" != None ]; then
+            echo "ERROR: spoke cluster ${CLUSTER_DEPLOYMENT} has stopped instances: ${stopped}"
+            echo "The Qumulo provider treats a stopped cluster as gone, so Terraform would lose"
+            echo "track of it. Start the instances, wait until they're running, then retry."
+            exit 1
+          fi
+        }
+
+        case "$TF_ACTION" in
+          apply)
+            for stack in ${TF_STACKS:-network cluster}; do
+              case "$stack" in
+                network) run network ;;
+                cluster)
+                  note_cluster_deployment
+                  require_cluster_running
+                  run cluster
+                  ;;
+                pcs) run pcs ;;
+                *) echo "TF_STACKS may list network, cluster and pcs, got '$stack'"; exit 1 ;;
+              esac
+            done
+            ;;
+          destroy)
+            note_cluster_deployment
+            require_cluster_running
+            # A failed terraform destroy doesn't stop the build: the sweep removes what's
+            # left (destroy is retried too), and the report says what, if anything,
+            # couldn't be removed. The workflow decides success from the report.
+            report=/tmp/cleanup-report.json
+            for attempt in 1 2 3; do
+              echo "===== destroy, attempt ${attempt} of 3 ====="
+              destroy_pcs || echo "terraform destroy of the PCS cluster failed; the sweep follows"
+              run cluster || echo "terraform destroy of the cluster failed; the sweep follows"
+              delete_cluster_log_groups || true
+              sweep_vpc_security_groups || true
+              run network || echo "terraform destroy of the network failed; the sweep follows"
+              echo "===== sweep and check ====="
+              if python3 cleanup.py sweep --hub "$TF_VAR_hub_name" --hub-region "$TF_VAR_hub_region" \
+                  --region "$TF_VAR_region" --vpc-cidr "$TF_VAR_vpc_cidr" \
+                  --report "$report" --run-id "${CODEBUILD_BUILD_ID:-}"; then
+                break
+              fi
+              if ! python3 -c 'import json, sys; sys.exit(not json.load(open(sys.argv[1]))["retryable"])' "$report"; then
+                echo "What's left needs a person; not retrying."
+                break
+              fi
+              # Some removals finish in the background (e.g. a NAT gateway, a peering connection).
+              if [ "$attempt" -lt 3 ]; then
+                echo "Leftovers remain; retrying in 2 minutes"
+                sleep 120
+              fi
+            done
+            aws s3 cp --region "$TF_STATE_REGION" "$report" "s3://${TF_STATE_BUCKET}/${TF_STATE_PREFIX}/cleanup-report.json"
+            ;;
+          *) echo "TF_ACTION must be apply or destroy, got '$TF_ACTION'"; exit 1 ;;
+        esac

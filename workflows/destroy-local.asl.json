@@ -1,0 +1,122 @@
+{
+  "Comment": "Local mode (docs/local-mode.md): remove what deploy-local created in hub ${hub_name}'s VPC (compute instance, PCS cluster, client resources), sweep anything left, check nothing is, and if clean delete local mode's state files. The hub itself is never touched. Input: {}.",
+  "StartAt": "TerminateCompute",
+  "States": {
+    "TerminateCompute": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${lambda_arn}",
+        "Payload": { "action": "terminate_compute", "region": "${hub_region}", "site": "local" }
+      },
+      "ResultSelector": { "terminated.$": "$.Payload.terminated" },
+      "ResultPath": "$.compute",
+      "Retry": [${lambda_retry}],
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "NotifyFailure" }],
+      "Next": "Destroy"
+    },
+    "Destroy": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::codebuild:startBuild.sync",
+      "Parameters": {
+        "ProjectName": "${codebuild_project}",
+        "EnvironmentVariablesOverride": [
+          { "Type": "PLAINTEXT", "Name": "TF_MODE", "Value": "local" },
+          { "Type": "PLAINTEXT", "Name": "TF_ACTION", "Value": "destroy" },
+          { "Type": "PLAINTEXT", "Name": "TF_STATE_PREFIX", "Value": "${hub_name}/local" },
+          { "Type": "PLAINTEXT", "Name": "TF_VAR_region", "Value": "${hub_region}" }
+        ]
+      },
+      "ResultSelector": { "build_id.$": "$.Build.Id" },
+      "ResultPath": "$.destroy",
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "NotifyFailure" }],
+      "Next": "ReadCleanupReport"
+    },
+    "ReadCleanupReport": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${lambda_arn}",
+        "Payload": { "action": "cleanup_report", "state_prefix": "${hub_name}/local", "build_id.$": "$.destroy.build_id" }
+      },
+      "ResultSelector": {
+        "clean.$": "$.Payload.clean",
+        "leftovers.$": "$.Payload.leftovers",
+        "check_errors.$": "$.Payload.check_errors",
+        "removed_by_sweep.$": "$.Payload.removed_by_sweep"
+      },
+      "ResultPath": "$.cleanup",
+      "Retry": [${lambda_retry}],
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "NotifyFailure" }],
+      "Next": "Clean?"
+    },
+    "Clean?": {
+      "Type": "Choice",
+      "Choices": [{ "Variable": "$.cleanup.clean", "BooleanEquals": true, "Next": "ForgetLocal" }],
+      "Default": "NotifyLeftovers"
+    },
+    "ForgetLocal": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${lambda_arn}",
+        "Payload": { "action": "forget_spoke", "state_prefix": "${hub_name}/local" }
+      },
+      "ResultSelector": { "deleted.$": "$.Payload.deleted" },
+      "ResultPath": "$.state_files",
+      "Retry": [${lambda_retry}],
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "$.state_files_error", "Next": "NotifySuccess" }],
+      "Next": "NotifySuccess"
+    },
+    "NotifyLeftovers": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "TopicArn": "${topic_arn}",
+        "Subject": "cnq-path-extender: local mode removed, LEFTOVERS need removing (hub ${hub_name})",
+        "Message.$": "States.JsonToString($.cleanup)"
+      },
+      "ResultPath": null,
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "$.notify_error", "Next": "LeftoversRemain" }],
+      "Next": "LeftoversRemain"
+    },
+    "LeftoversRemain": {
+      "Type": "Fail",
+      "Error": "LeftoversRemain",
+      "Cause": "Some of local mode's resources couldn't be removed automatically; the notification lists them. spoke/local/cleanup.py check confirms when they're gone."
+    },
+    "NotifySuccess": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "TopicArn": "${topic_arn}",
+        "Subject": "cnq-path-extender: local mode removed (hub ${hub_name})",
+        "Message.$": "States.JsonToString($)"
+      },
+      "ResultPath": null,
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "$.notify_error", "Next": "Done" }],
+      "End": true
+    },
+    "Done": {
+      "Type": "Succeed",
+      "Comment": "Reached only when the success email couldn't be sent; the work itself succeeded."
+    },
+    "NotifyFailure": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "TopicArn": "${topic_arn}",
+        "Subject": "cnq-path-extender: local mode removal FAILED (hub ${hub_name})",
+        "Message.$": "States.JsonToString($)"
+      },
+      "ResultPath": null,
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "$.notify_error", "Next": "Failed" }],
+      "Next": "Failed"
+    },
+    "Failed": {
+      "Type": "Fail",
+      "ErrorPath": "$.error.Error",
+      "CausePath": "$.error.Cause"
+    }
+  }
+}

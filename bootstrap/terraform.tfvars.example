@@ -1,0 +1,25 @@
+# Copy to terraform.tfvars and fill in.
+
+# Hub
+hub_region                 = "us-west-2"
+hub_deployment_unique_name = "hubprod-a1b2c3"
+hub_admin_secret_arn       = "arn:aws:secretsmanager:us-west-2:123456789012:secret:qumulo/hub-admin-AbCdEf"
+
+# Control plane
+state_bucket       = "my-tf-state-bucket"
+notification_email = "you@example.com"
+
+# OPTIONAL: tags on everything the control plane and spokes create, for example tags your
+# AWS organization requires before EC2 instances can launch. Keep real values here in
+# terraform.tfvars only; it is not committed.
+# extra_tags = {
+#   "owner"       = "you@example.com"
+#   "cost-center" = "1234"
+# }
+
+# Spoke defaults (instance_type and node_count can be overridden per launch)
+default_instance_type = "i7i.8xlarge"
+default_node_count    = 3
+spoke_capacity_tb     = 100
+spoke_product_type    = "HOT"
+portal_type           = "PORTAL_READ_WRITE"
